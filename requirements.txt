@@ -7,3 +7,4 @@ certifi
 charset-normalizer
 idna
 typing-extensions
+flask
