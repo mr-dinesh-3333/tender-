@@ -1,8 +1,12 @@
-import requests
+from flask import Flask, jsonify
 from bs4 import BeautifulSoup
 from pymongo import MongoClient
+import requests
 import time
 from datetime import datetime
+
+# Initialize Flask app
+app = Flask(__name__)
 
 # MongoDB connection
 MONGO_URI = "mongodb+srv://dinesh2003:7386531980@cluster0.gaw7dkr.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
@@ -14,7 +18,7 @@ collection = db["eprocure_tenders"]
 FILTER_KEYWORDS = ['software', 'web development', 'web dev', 'AI', 'data entry', 'artificial intelligence']
 
 def scrape_tenders():
-    print(f"\n⏱️ Starting new scraping cycle at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"\n⏱️ Scraping started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     page = 1
     max_pages = 5
     new_tenders = 0
@@ -35,12 +39,10 @@ def scrape_tenders():
                 timeout=30
             )
             response.raise_for_status()
-            
             soup = BeautifulSoup(response.content, 'html.parser')
             listing = soup.find_all('tbody')
             
             if not listing:
-                print(f"⚠️ No listings found on page {page}")
                 break
 
             for data in listing:
@@ -65,12 +67,9 @@ def scrape_tenders():
                 except:
                     org_name = ''
 
-                # Skip if tender exists
                 if collection.find_one({"url": url}):
-                    print(f"⏩ Already exists: {title[:50]}...")
                     continue
 
-                # Keyword filtering
                 if any(keyword.lower() in title.lower() for keyword in FILTER_KEYWORDS):
                     tender = {
                         "title": title,
@@ -83,34 +82,32 @@ def scrape_tenders():
                     }
                     collection.insert_one(tender)
                     new_tenders += 1
-                    print(f"✅ Inserted: {title[:50]}...")
-                else:
-                    print(f"⛔ Skipped: {title[:50]}...")
 
-            print(f"📄 Processed page {page}/{max_pages}")
             page += 1
-            time.sleep(2)  # Be polite to the server
+            time.sleep(1)
 
-        except requests.exceptions.RequestException as e:
-            print(f"🌐 Network error: {e}")
         except Exception as e:
-            print(f"❗ Unexpected error: {e}")
-    
-    print(f"✨ Scraping complete. Added {new_tenders} new tenders.")
+            print(f"❗ Error on page {page}: {e}")
+            break
+
+    print(f"✅ Scraping done. New tenders: {new_tenders}")
     return new_tenders
 
-# Continuous operation for Render
-if __name__ == "__main__":
-    print("🚀 Tender Scraper Service Started")
-    while True:
-        try:
-            scrape_tenders()
-            # Run every 6 hours (21600 seconds)
-            print("😴 Sleeping for 6 hours...")
-            time.sleep(21600)
-        except KeyboardInterrupt:
-            print("\n🛑 Service stopped by user")
-            break
-        except Exception as e:
-            print(f"🔥 Critical error: {e}. Restarting in 5 minutes...")
-            time.sleep(300)
+# Flask Routes
+@app.route('/')
+def home():
+    return "✅ Government Tender Scraper is Live!"
+
+@app.route('/tenders', methods=['GET'])
+def run_scraper():
+    try:
+        count = scrape_tenders()
+        return jsonify({"status": "success", "new_tenders_added": count})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# Main entry
+if __name__ == '__main__':
+    import os
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
