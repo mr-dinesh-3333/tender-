@@ -1,3 +1,6 @@
+# ⬇️ Add these two lines at the VERY TOP ⬇️
+import os
+os.environ["PYTHONMALLOC"] = "malloc"  # Memory allocation fix
 from flask import Flask, jsonify
 import requests
 from bs4 import BeautifulSoup
