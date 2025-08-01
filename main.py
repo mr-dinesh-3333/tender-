@@ -1,3 +1,4 @@
+import os
 from flask import Flask, jsonify
 import requests
 from bs4 import BeautifulSoup
@@ -8,12 +9,23 @@ import ssl
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import logging
-import time  # Added missing import
+import time
+from functools import wraps
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 # Initialize Flask app
 app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
-# Configure logging without emojis
+# Configuration from environment variables
+EMAIL_SENDER = os.getenv('SMTP_USER')
+EMAIL_PASSWORD = os.getenv('SMTP_PASSWORD')
+EMAIL_RECEIVER = os.getenv('NOTIFICATION_EMAIL')
+MONGO_URI = os.getenv('MONGODB_URI')
+TWILIO_SID = os.getenv('TWILIO_SID')
+TWILIO_TOKEN = os.getenv('TWILIO_TOKEN')
+
+# Configure production logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -22,205 +34,197 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+logger = logging.getLogger(__name__)
 
-# Email configuration
-EMAIL_SENDER = "gavinidineshkumar@gmail.com"
-EMAIL_PASSWORD = "bmvg cggd yomw zmaf"  # App Password
-EMAIL_RECEIVER = "gavinidineshkumar@gmail.com"
+# Rate limiting decorator
+def rate_limit(max_per_minute):
+    interval = 60 / max_per_minute
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            now = time.time()
+            elapsed = now - wrapper.last_called if hasattr(wrapper, 'last_called') else interval
+            if elapsed < interval:
+                time.sleep(interval - elapsed)
+            wrapper.last_called = time.time()
+            return f(*args, **kwargs)
+        return wrapper
+    return decorator
 
-# Enhanced email function with debugging
-def send_email(subject, body):
+# Enhanced email function with retries
+def send_email(subject, body, max_retries=3):
     msg = MIMEMultipart()
     msg['From'] = EMAIL_SENDER
     msg['To'] = EMAIL_RECEIVER
     msg['Subject'] = subject
     msg.attach(MIMEText(body, 'plain'))
-    
-    context = ssl.create_default_context()
-    
-    # Try SSL first (port 465)
-    try:
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465, context=context) as server:
-            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-            server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
-        logging.info("Email sent successfully via SSL!")
-        return True
-    except Exception as e:
-        logging.error(f"SSL failed: {e}")
-    
-    # Try TLS as fallback (port 587)
-    try:
-        with smtplib.SMTP('smtp.gmail.com', 587) as server:
-            server.ehlo()
-            server.starttls(context=context)
-            server.ehlo()
-            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-            server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
-        logging.info("Email sent successfully via TLS!")
-        return True
-    except Exception as e:
-        logging.error(f"STARTTLS failed: {e}")
-        return False
 
-# MongoDB connection
-client = MongoClient("mongodb+srv://dinesh2003:7386531980@cluster0.gaw7dkr.mongodb.net/?retryWrites=true&w=majority")
-db = client["gov_tenders"]
-collection = db["eprocure_tenders"]
+    context = ssl.create_default_context()
+    last_exception = None
+
+    for attempt in range(max_retries):
+        try:
+            # Try SSL first (port 465)
+            with smtplib.SMTP_SSL('smtp.gmail.com', 465, context=context, timeout=10) as server:
+                server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+                server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
+            logger.info("Email sent successfully via SSL")
+            return True
+        except Exception as e:
+            last_exception = e
+            logger.warning(f"SSL attempt {attempt + 1} failed: {str(e)}")
+            time.sleep(2 ** attempt)  # Exponential backoff
+
+    logger.error(f"All email attempts failed. Last error: {str(last_exception)}")
+    return False
+
+# MongoDB connection with error handling
+def get_mongo_client():
+    try:
+        client = MongoClient(MONGO_URI, 
+                           connectTimeoutMS=30000,
+                           socketTimeoutMS=30000,
+                           serverSelectionTimeoutMS=30000)
+        client.admin.command('ping')  # Test connection
+        return client
+    except Exception as e:
+        logger.error(f"MongoDB connection failed: {str(e)}")
+        raise
 
 # Keywords to filter tenders
 FILTER_KEYWORDS = ['software', 'web development', 'web dev', 'AI', 'data entry', 'artificial intelligence']
 
-# Helper to fix ObjectId issue
-def clean_mongo_ids(data):
-    for item in data:
-        item["_id"] = str(item["_id"])
-    return data
-
-# Scraper function with email notifications
+# Scraper function with enhanced error handling
+@rate_limit(5)  # 5 requests per minute
 def scrape_and_save_tenders():
+    client = get_mongo_client()
+    db = client["gov_tenders"]
+    collection = db["eprocure_tenders"]
+    
+    # Create indexes if they don't exist
+    collection.create_index([("url", 1)], unique=True)
+    collection.create_index([("tender_name", "text")])
+
     all_data = []
     page = 1
+    max_pages = 5
     new_tenders = 0
     found_keyword_tenders = False
 
-    # Test email before scraping
-    logging.info("Testing email service...")
-    if not send_email("TENDER SCRAPER STARTED", "Scraping process initiated successfully"):
-        logging.error("Email test failed. Check credentials!")
-    else:
-        logging.info("Email test successful")
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.5'
+    })
 
-    while True:
-        cookies = {
-            'cookieWorked': 'yes',
-            'SSESS4e4a4d945e1f90e996acd5fb569779de': '6dJ1kcF3FqZAMvAHtXpX_Vyv8XAkAjzA60YFZ9TSQ5w',
-        }
-
-        headers = {
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
-            'Referer': 'https://eprocure.gov.in/',
-        }
-
-        params = {'page': str(page)}
-        logging.info(f"Scraping page {page}...")
-
+    while page <= max_pages:
         try:
-            response = requests.get(
+            logger.info(f"Scraping page {page}")
+            params = {'page': str(page)}
+            response = session.get(
                 'https://eprocure.gov.in/cppp/latestactivetendersnew/cpppdata',
                 params=params,
-                cookies=cookies,
-                headers=headers,
+                cookies={'cookieWorked': 'yes'},
                 timeout=30
             )
             response.raise_for_status()
-            
-            # Save HTML for debugging
-            with open(f"page_{page}.html", "w", encoding="utf-8") as f:
-                f.write(response.text)
-                
-        except Exception as e:
-            logging.error(f"Network error: {e}")
-            break
 
-        soup = BeautifulSoup(response.content, 'html.parser')
-        listing = soup.find_all('tbody')
+            soup = BeautifulSoup(response.content, 'html.parser')
+            listing = soup.find_all('tbody')
 
-        if page == 5 or not listing:
-            logging.info("Reached end of pages")
-            break
+            if not listing:
+                logger.info("No more tender listings found")
+                break
 
-        for data in listing:
-            try:
-                publish_date = data.find_all('td')[1].text.strip()
-            except:
-                publish_date = ''
-            try:
-                close_date = data.find_all('td')[2].text.strip()
-            except:
-                close_date = ''
-            try:
-                opening_date = data.find_all('td')[3].text.strip()
-            except:
-                opening_date = ''
-            try:
-                tender_name = data.find('a', {'title': 'External Url'}).text.strip()
-            except:
-                tender_name = ''
-            try:
-                tender_url = data.find('a')['href']
-            except:
-                tender_url = ''
-            try:
-                org_name = data.find_all('td')[5].text.strip()
-            except:
-                org_name = ''
+            for data in listing:
+                try:
+                    cells = data.find_all('td')
+                    if len(cells) < 6:
+                        continue
 
-            # Skip if tender exists
-            if collection.find_one({"url": tender_url}):
-                continue
+                    tender_name = cells[0].find('a', {'title': 'External Url'}).text.strip() if cells[0].find('a') else ''
+                    tender_url = cells[0].find('a')['href'] if cells[0].find('a') else ''
+                    publish_date = cells[1].text.strip()
+                    close_date = cells[2].text.strip()
+                    org_name = cells[5].text.strip()
 
-            record = {
-                "tender_name": tender_name,
-                "publish_date": publish_date,
-                "closing_date": close_date,
-                "opening_date": opening_date,
-                "organisation": org_name,
-                "url": tender_url,
-                "scraped_at": datetime.datetime.now()
-            }
+                    if collection.find_one({"url": tender_url}):
+                        continue
 
-            # Check if tender matches keywords
-            keyword_match = any(
-                keyword.lower() in tender_name.lower() 
-                for keyword in FILTER_KEYWORDS
-            ) if tender_name else False
+                    record = {
+                        "tender_name": tender_name,
+                        "publish_date": publish_date,
+                        "closing_date": close_date,
+                        "organisation": org_name,
+                        "url": tender_url,
+                        "scraped_at": datetime.datetime.utcnow()
+                    }
 
-            # Save to database
-            inserted = collection.insert_one(record)
-            record["_id"] = inserted.inserted_id
-            all_data.append(record)
-            new_tenders += 1
+                    collection.insert_one(record)
+                    new_tenders += 1
+                    all_data.append(record)
 
-            # Send email for keyword matches
-            if keyword_match:
-                found_keyword_tenders = True
-                subject = f"New Tender: {tender_name[:50]}"
-                body = f"""New Government Tender Found:
-
+                    # Check for keyword matches
+                    if any(keyword.lower() in tender_name.lower() for keyword in FILTER_KEYWORDS):
+                        found_keyword_tenders = True
+                        email_body = f"""New Tender Found:
 Title: {tender_name}
-Organisation: {org_name}
-Publish Date: {publish_date}
-Closing Date: {close_date}
-URL: https://eprocure.gov.in{tender_url}
-"""
-                if not send_email(subject, body):
-                    # Fallback: Save to file if email fails
-                    with open("failed_emails.txt", "a") as f:
-                        f.write(f"Subject: {subject}\n\n{body}\n\n")
+Organization: {org_name}
+Published: {publish_date}
+Closes: {close_date}
+URL: https://eprocure.gov.in{tender_url}"""
+                        send_email(f"New Tender: {tender_name[:50]}", email_body)
 
-        page += 1
-        time.sleep(2)  # Respectful delay
+                except Exception as e:
+                    logger.error(f"Error processing tender: {str(e)}")
+                    continue
 
-    # Final report
-    logging.info(f"Scraping complete. New tenders: {new_tenders}")
-    if not found_keyword_tenders:
+            page += 1
+            time.sleep(5)  # Respectful delay between pages
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request failed: {str(e)}")
+            break
+        except Exception as e:
+            logger.error(f"Unexpected error: {str(e)}")
+            break
+
+    client.close()
+    logger.info(f"Scraping complete. New tenders: {new_tenders}")
+    
+    if not found_keyword_tenders and new_tenders > 0:
         send_email(
-            "Tender Scraper Report", 
+            "Tender Scraper Report",
             f"Scraped {new_tenders} new tenders but none matched your keywords."
         )
-    
-    return clean_mongo_ids(all_data)
 
-# Scrape and show data when hitting "/"
-@app.route("/", methods=["GET"])
+    return all_data
+
+# API Endpoints
+@app.route('/')
 def home():
-    return jsonify(scrape_and_save_tenders())
+    return jsonify({
+        "status": "running",
+        "service": "Government Tender Scraper",
+        "version": "1.0.0"
+    })
 
-# Optional status check
-@app.route("/status", methods=["GET"])
-def status():
-    return "Tender API is Live with MongoDB. Go to `/` to scrape + store."
+@app.route('/scrape', methods=['GET'])
+def scrape_endpoint():
+    try:
+        data = scrape_and_save_tenders()
+        return jsonify({
+            "status": "success",
+            "new_tenders": len(data),
+            "data": data[:10]  # Return first 10 for demo
+        })
+    except Exception as e:
+        logger.error(f"API error: {str(e)}")
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
