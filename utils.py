@@ -1,17 +1,21 @@
+import logging
 from twilio.rest import Client
+import os
 
 def send_whatsapp_alert(message):
-    account_sid = "AC1ae038f3084933d8a95b12c5f70c6e7c"  # Your Twilio SID
-    auth_token = "b11e46e3f8883673fef8dc35538a8d59"     # Your Twilio Token
-
-    client = Client(account_sid, auth_token)
-
     try:
+        account_sid = os.getenv("TWILIO_SID", "AC1ae038f3084933d8a95b12c5f70c6e7c")
+        auth_token = os.getenv("TWILIO_TOKEN", "b11e46e3f8883673fef8dc35538a8d59")
+        
+        client = Client(account_sid, auth_token)
+        
         message = client.messages.create(
             body=message,
-            from_="whatsapp:+14155238886",      # Twilio sandbox number
-            to="whatsapp:+917386531980"          # YOUR verified WhatsApp number
+            from_="whatsapp:+14155238886",
+            to="whatsapp:+917386531980"
         )
-        print("✅ WhatsApp message sent:", message.sid)
+        logging.info(f"WhatsApp message sent: {message.sid}")
+        return True
     except Exception as e:
-        print("❌ Failed to send WhatsApp alert:", e)
+        logging.error(f"WhatsApp failed: {e}")
+        return False
