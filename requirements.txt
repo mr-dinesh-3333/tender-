@@ -1,10 +1,6 @@
+flask
 requests
 beautifulsoup4
 pymongo
 twilio
-aiohttp==3.9.3
-certifi
-charset-normalizer
-idna
-typing-extensions
-flask
+python-dotenv
