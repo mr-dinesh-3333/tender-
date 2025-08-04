@@ -8,7 +8,8 @@ from pymongo import MongoClient
 import datetime
 import logging
 import time
-from utils import send_whatsapp_alert  # Import WhatsApp function
+# Replace email-related imports with:
+from email_utils import send_email  # Adjust based on your functions  # Import WhatsApp function
 from summarize import summarize_tender  # Import summarizer
 import os
 
@@ -171,3 +172,4 @@ def status():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+
